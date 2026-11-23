@@ -1,9 +1,9 @@
-
+import time
 import socket
 import struct
 import sys
 
-
+DNS_CACHE = {}
 ROOT_SERVER = ("198.41.0.4", 53)
 MAX_REFERRALS = 10
 
@@ -221,6 +221,101 @@ def get_nameserver_ip(sections, visited):
 # ITERATIVE DNS RESOLUTION
 # --------------------------------------------------
 
+
+def get_cached_response(domain, qtype, qclass, request):
+	key = (domain.lower(), qtype, qclass)
+
+	if key not in DNS_CACHE:
+		print(f"Cache MISS: {domain}")
+		return None
+
+	entry = DNS_CACHE[key]
+	now = time.monotonic()
+
+	if now >= entry["expires"]:
+		del DNS_CACHE[key]
+		print(f"Cache EXPIRED: {domain}")
+		return None
+
+	remaining = entry["expires"] - now
+	response = bytearray(entry["response"])
+
+	# Update each cached record's TTL
+	for ttl_offset, original_ttl in entry["ttls"]:
+		new_ttl = max(0, int(original_ttl - (now - entry["stored"])))
+		struct.pack_into("!I", response, ttl_offset, new_ttl)
+
+	# Restore the client's transaction ID
+	response[:2] = request[:2]
+
+	# Preserve the client's recursion-desired flag
+	flags = struct.unpack("!H", response[2:4])[0]
+	request_flags = struct.unpack("!H", request[2:4])[0]
+
+	flags = (flags & ~0x0100) | (request_flags & 0x0100)
+	struct.pack_into("!H", response, 2, flags)
+
+	print(f"Cache HIT: {domain} ({remaining:.1f}s remaining)")
+	return bytes(response)
+
+
+def cache_response(domain, qtype, qclass, response):
+	sections = parse_dns_response(response)
+
+	# Do not cache negative or empty answers
+	flags = struct.unpack("!H", response[2:4])[0]
+
+	if flags & 0x000F:
+		return
+
+	if not sections["answers"]:
+		return
+
+	# Cache by the shortest answer TTL
+	ttl = min(record["ttl"] for record in sections["answers"])
+
+	if ttl <= 0:
+		return
+
+	# Locate TTL fields in the original DNS message
+	ttl_offsets = []
+	_, _, qd, an, ns, ar = struct.unpack("!HHHHHH", response[:12])
+
+	offset = 12
+
+	for _ in range(qd):
+		_, offset = read_name(response, offset)
+		offset += 4
+
+	for _ in range(an + ns + ar):
+		_, offset = read_name(response, offset)
+
+		if offset + 10 > len(response):
+			raise ValueError("Truncated DNS record")
+
+		rtype, rclass, record_ttl, rdlength = struct.unpack(
+			"!HHIH", response[offset:offset + 10]
+		)
+
+		# OPT records use this field for EDNS flags, not TTL
+		if rtype != 41:
+			ttl_offsets.append((offset + 4, record_ttl))
+
+		offset += 10 + rdlength
+
+	now = time.monotonic()
+	key = (domain.lower(), qtype, qclass)
+
+	DNS_CACHE[key] = {
+		"response": bytes(response),
+		"stored": now,
+		"expires": now + ttl,
+		"ttls": ttl_offsets
+	}
+
+	print(f"Cached {domain} for {ttl} seconds")
+
+
 def query_upstream(data):
 	if len(data) < 12:
 		raise ValueError("DNS query too short")
@@ -318,10 +413,16 @@ def main():
 				parse_header(data)
 				domain, qtype, qclass = parse_question(data)
 
-				response = query_upstream(data)
+				
+				response = get_cached_response(domain, qtype, qclass, data)
+
+				if response is None:
+					response = query_upstream(data)
+					cache_response(domain, qtype, qclass, response)
 
 				sock.sendto(response, address)
 				print(f"Resolved DNS query for {domain}")
+
 
 			except (
 				ValueError,
