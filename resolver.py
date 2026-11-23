@@ -80,8 +80,21 @@ def validate_request(data):
 		record, offset = parse_record(data, offset)
 		if has_edns or record["type"] != 41 or record["name"] != "":
 			raise ValueError("Invalid DNS additional record")
-		if record["ttl"] != 0 or record["rdata"]:
-			raise ValueError("Unsupported EDNS flags, version, or options")
+		# OPT TTL holds extended RCODE, EDNS version, and flags.
+		# Version 0 is supported; unknown well-formed options can be ignored.
+		edns_version = (record["ttl"] >> 16) & 0xFF
+		if edns_version != 0:
+			raise ValueError("Unsupported EDNS version")
+		options = record["rdata"]
+		pos = 0
+		while pos < len(options):
+			if pos + 4 > len(options):
+				raise ValueError("Truncated EDNS option header")
+			option_code, option_length = struct.unpack("!HH", options[pos:pos + 4])
+			pos += 4
+			if pos + option_length > len(options):
+				raise ValueError("Truncated EDNS option data")
+			pos += option_length
 		has_edns = True
 		client_udp_size = max(512, record["class"])
 
