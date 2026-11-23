@@ -1,16 +1,24 @@
 
 import socket
-import sys
 import struct
+import sys
 
+
+ROOT_SERVER = ("198.41.0.4", 53)
+MAX_REFERRALS = 10
+
+
+# --------------------------------------------------
+# DNS HEADER
+# --------------------------------------------------
 
 def parse_header(data):
 	if len(data) < 12:
 		raise ValueError("DNS packet too short")
 
-	header = struct.unpack("!HHHHHH", data[:12])
-
-	transaction_id, flags, qdcount, ancount, nscount, arcount = header
+	transaction_id, flags, qdcount, ancount, nscount, arcount = struct.unpack(
+		"!HHHHHH", data[:12]
+	)
 
 	print(f"Transaction ID: {transaction_id}")
 	print(f"Flags: {flags:016b}")
@@ -19,38 +27,77 @@ def parse_header(data):
 	print(f"Authority records: {nscount}")
 	print(f"Additional records: {arcount}")
 
+	return transaction_id, flags, qdcount, ancount, nscount, arcount
 
-def parse_question(data):
-	offset = 12
+
+# --------------------------------------------------
+# DNS NAME DECODING
+# --------------------------------------------------
+
+def read_name(data, offset):
 	labels = []
+	end_offset = None
+	visited = set()
+	total_length = 1
 
 	while True:
 		if offset >= len(data):
-			raise ValueError("Incomplete DNS name")
+			raise ValueError("DNS name extends beyond packet")
 
+		if offset in visited:
+			raise ValueError("DNS compression pointer loop")
+
+		visited.add(offset)
 		length = data[offset]
+
+		if length & 0xC0 == 0xC0:
+			if offset + 1 >= len(data):
+				raise ValueError("Truncated compression pointer")
+
+			pointer = ((length & 0x3F) << 8) | data[offset + 1]
+
+			if pointer >= offset:
+				raise ValueError("Invalid DNS compression pointer")
+
+			if end_offset is None:
+				end_offset = offset + 2
+
+			offset = pointer
+			continue
+
+		if length & 0xC0:
+			raise ValueError("Invalid DNS label encoding")
+
 		offset += 1
 
 		if length == 0:
 			break
 
-		if length > 63:
-			raise ValueError("Invalid DNS label length")
-
 		if offset + length > len(data):
 			raise ValueError("Truncated DNS label")
 
-		label = data[offset:offset + length].decode("ascii")
-		labels.append(label)
+		total_length += length + 1
 
+		if total_length > 255:
+			raise ValueError("DNS name exceeds 255 bytes")
+
+		labels.append(data[offset:offset + length].decode("ascii"))
 		offset += length
+
+	return ".".join(labels), end_offset if end_offset is not None else offset
+
+
+# --------------------------------------------------
+# DNS QUESTION
+# --------------------------------------------------
+
+def parse_question(data):
+	domain, offset = read_name(data, 12)
 
 	if offset + 4 > len(data):
 		raise ValueError("Incomplete DNS question")
 
 	qtype, qclass = struct.unpack("!HH", data[offset:offset + 4])
-
-	domain = ".".join(labels)
 
 	print(f"Domain: {domain}")
 	print(f"Query type: {qtype}")
@@ -59,91 +106,237 @@ def parse_question(data):
 	return domain, qtype, qclass
 
 
-def build_response(data):
-	transaction_id, flags, qdcount, _, _, _ = struct.unpack(
+# --------------------------------------------------
+# DNS RESOURCE RECORD
+# --------------------------------------------------
+
+def parse_record(data, offset):
+	name, offset = read_name(data, offset)
+
+	if offset + 10 > len(data):
+		raise ValueError("Truncated DNS resource record")
+
+	rtype, rclass, ttl, rdlength = struct.unpack(
+		"!HHIH", data[offset:offset + 10]
+	)
+
+	offset += 10
+	rdata_offset = offset
+
+	if offset + rdlength > len(data):
+		raise ValueError("Truncated DNS record data")
+
+	rdata = data[offset:offset + rdlength]
+	offset += rdlength
+
+	record = {
+		"name": name,
+		"type": rtype,
+		"class": rclass,
+		"ttl": ttl,
+		"rdata": rdata
+	}
+
+	if rtype == 1 and rdlength == 4:
+		record["address"] = socket.inet_ntoa(rdata)
+
+	elif rtype == 2:
+		ns_name, ns_end = read_name(data, rdata_offset)
+
+		if ns_end != rdata_offset + rdlength:
+			raise ValueError("Invalid NS record")
+
+		record["ns"] = ns_name
+
+	return record, offset
+
+
+# --------------------------------------------------
+# PARSE DNS RESPONSE SECTIONS
+# --------------------------------------------------
+
+def parse_dns_response(data):
+	if len(data) < 12:
+		raise ValueError("Truncated DNS response")
+
+	_, _, qdcount, ancount, nscount, arcount = struct.unpack(
 		"!HHHHHH", data[:12]
 	)
 
-	# QR=1, AA=1 (for this test only), preserve RD
-	response_flags = 0x8400 | (flags & 0x0100)
-
 	offset = 12
 
-	while data[offset] != 0:
-		offset += data[offset] + 1
+	for _ in range(qdcount):
+		_, offset = read_name(data, offset)
 
-	offset += 1
-	question_end = offset + 4
+		if offset + 4 > len(data):
+			raise ValueError("Truncated DNS question")
 
-	question = data[12:question_end]
+		offset += 4
 
-	# Pointer to question name at offset 12
-	name = b"\xc0\x0c"
+	sections = {}
 
-	# TYPE=A, CLASS=IN, TTL=60, RDLENGTH=4
-	record = struct.pack("!HHIH", 1, 1, 60, 4)
+	for section, count in [
+		("answers", ancount),
+		("authority", nscount),
+		("additional", arcount)
+	]:
+		records = []
 
-	# Fixed test IP address
-	ip_address = socket.inet_aton("1.2.3.4")
+		for _ in range(count):
+			record, offset = parse_record(data, offset)
+			records.append(record)
 
-	answer = name + record + ip_address
+		sections[section] = records
 
-	header = struct.pack(
-		"!HHHHHH",
-		transaction_id,
-		response_flags,
-		1,
-		1,
-		0,
-		0
-	)
+	if offset != len(data):
+		raise ValueError("Unexpected trailing DNS data")
 
-	return header + question + answer
+	return sections
+
+
+# --------------------------------------------------
+# FIND NEXT NAMESERVER
+# --------------------------------------------------
+
+def get_nameserver_ip(sections, visited):
+	ns_names = {
+		record["ns"].lower()
+		for record in sections["authority"]
+		if record["type"] == 2 and "ns" in record
+	}
+
+	for record in sections["additional"]:
+		if (
+			record["type"] == 1
+			and "address" in record
+			and record["name"].lower() in ns_names
+			and record["address"] not in visited
+		):
+			return record["address"]
+
+	return None
+
+
+# --------------------------------------------------
+# ITERATIVE DNS RESOLUTION
+# --------------------------------------------------
 
 def query_upstream(data):
-	upstream = ("8.8.8.8", 53)
+	if len(data) < 12:
+		raise ValueError("DNS query too short")
 
-	with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
-		upstream_sock.settimeout(3)
-		upstream_sock.sendto(data, upstream)
+	# Disable recursion (RD = 0)
+	flags = struct.unpack("!H", data[2:4])[0]
+	flags &= ~0x0100
 
-		response, address = upstream_sock.recvfrom(4096)
+	query = data[:2] + struct.pack("!H", flags) + data[4:]
 
-		if address != upstream:
-			raise ValueError("Unexpected upstream DNS server")
+	server_ip = ROOT_SERVER[0]
+	visited = set()
 
-		return response
+	for step in range(MAX_REFERRALS):
+		if server_ip in visited:
+			raise ValueError("DNS referral loop detected")
+
+		visited.add(server_ip)
+
+		print(f"\nStep {step + 1}: Querying {server_ip}")
+
+		with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
+			upstream_sock.settimeout(3)
+			upstream_sock.sendto(query, (server_ip, 53))
+
+			response, address = upstream_sock.recvfrom(4096)
+
+			if address != (server_ip, 53):
+				raise ValueError("Unexpected DNS server")
+
+		if len(response) < 12:
+			raise ValueError("Truncated DNS response")
+
+		if response[:2] != query[:2]:
+			raise ValueError("DNS transaction ID mismatch")
+
+		response_flags = struct.unpack("!H", response[2:4])[0]
+
+		if not (response_flags & 0x8000):
+			raise ValueError("Received packet is not a DNS response")
+
+		sections = parse_dns_response(response)
+
+		_, _, _, an, ns, ar = struct.unpack(
+			"!HHHHHH", response[:12]
+		)
+
+		print(f"Answers: {an}")
+		print(f"Authority records: {ns}")
+		print(f"Additional records: {ar}")
+
+		rcode = response_flags & 0x000F
+
+		if rcode != 0:
+			print(f"DNS response code: {rcode}")
+			return response
+
+		if sections["answers"]:
+			print("Final DNS answer received")
+			return response
+
+		if response_flags & 0x0400:
+			print("Authoritative response received")
+			return response
+
+		next_ip = get_nameserver_ip(sections, visited)
+
+		if next_ip is None:
+			raise ValueError("No usable IPv4 nameserver referral found")
+
+		print(f"Following referral to {next_ip}")
+		server_ip = next_ip
+
+	raise ValueError("Maximum DNS referral depth exceeded")
+
+
+# --------------------------------------------------
+# UDP DNS SERVER
+# --------------------------------------------------
 
 def main():
 	port = int(sys.argv[1]) if len(sys.argv) > 1 else 53
 
-	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-	sock.bind(("0.0.0.0", port))
+	with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+		sock.bind(("0.0.0.0", port))
 
-	print(f"DNS resolver listening on UDP port {port}", flush=True)
+		print(f"DNS resolver listening on UDP port {port}", flush=True)
 
-	while True:
-		data, address = sock.recvfrom(4096)
+		while True:
+			data, address = sock.recvfrom(4096)
 
-		print(f"\nReceived {len(data)} bytes from {address}")
-		print(f"Raw packet: {data.hex()}")
+			print(f"\nReceived {len(data)} bytes from {address}")
 
-		try:
-			parse_header(data)
-			domain, qtype, qclass = parse_question(data)
+			try:
+				parse_header(data)
+				domain, qtype, qclass = parse_question(data)
 
-			response = query_upstream(data)
-			sock.sendto(response, address)
-			print(f"Forwarded real DNS response for {domain}")
+				response = query_upstream(data)
 
-		except (ValueError, IndexError, UnicodeError, struct.error, socket.timeout, OSError) as e:
-			print(f"Invalid DNS packet: {e}")
+				sock.sendto(response, address)
+				print(f"Resolved DNS query for {domain}")
+
+			except (
+				ValueError,
+				IndexError,
+				UnicodeError,
+				struct.error,
+				socket.timeout,
+				OSError
+			) as e:
+				print(f"DNS query failed: {e}")
 
 
 if __name__ == "__main__":
 	try:
-		 main()
+		main()
 	except KeyboardInterrupt:
 		print("\nDNS resolver stopped.")
-	
 
